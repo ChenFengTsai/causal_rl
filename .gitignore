@@ -6,3 +6,8 @@
 *.zip
 pushing_episodes/
 venv/
+src/pushing
+src/reaching
+src/models
+events.out.tfevents.*
+
