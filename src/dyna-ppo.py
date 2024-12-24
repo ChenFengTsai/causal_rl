@@ -1,15 +1,16 @@
 import gymnasium
 import numpy as np
+import torch
+import torch.nn as nn
+import os
+import time
+import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
-import torch
-import time
-import os
+from stable_baselines3.common.buffers import ReplayBuffer
 from metrics_logger import MetricsLogger
-import pandas as pd
-
 
 
 class RewardCallback(BaseCallback):
@@ -126,10 +127,63 @@ class RewardCallback(BaseCallback):
             df.to_csv(filepath, mode='a', header=False, index=False)
         else:
             df.to_csv(filepath, index=False)
+            
+# Dynamics Model
+class DynamicsModel(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super(DynamicsModel, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, state_dim)  # Predict next state
+        )
+    
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim=1)
+        return self.model(x)
 
+def train_dynamics_model(dynamics_model, real_data, epochs=20, batch_size=64, lr=1e-3):
+    optimizer = torch.optim.Adam(dynamics_model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
 
+    states, actions, next_states = real_data
+    states = torch.tensor(states, dtype=torch.float32)
+    actions = torch.tensor(actions, dtype=torch.float32)
+    next_states = torch.tensor(next_states, dtype=torch.float32)
 
-def train(
+    dataset = torch.utils.data.TensorDataset(states, actions, next_states)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    for epoch in range(epochs):
+        for batch_states, batch_actions, batch_next_states in dataloader:
+            predictions = dynamics_model(batch_states, batch_actions)
+            loss = loss_fn(predictions, batch_next_states)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+def generate_synthetic_rollouts(dynamics_model, buffer, policy, rollout_horizon=5):
+    synthetic_states, synthetic_actions, synthetic_next_states = [], [], []
+    for i in range(buffer.size()):
+        state = buffer.sample(1).observations[0]
+        for _ in range(rollout_horizon):
+            # # Random action for simplicity
+            # action = np.random.uniform(-1, 1, size=env.action_space.shape)  
+            # Get the most probable action from the policy
+            action, _ = policy.predict(state, deterministic=True)
+            action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+            next_state = dynamics_model(state_tensor, action_tensor).detach().numpy()[0]
+            synthetic_states.append(state)
+            synthetic_actions.append(action)
+            synthetic_next_states.append(next_state)
+            state = next_state
+    return np.array(synthetic_states), np.array(synthetic_actions), np.array(synthetic_next_states)
+
+# Modified train function
+def train_dyna_ppo(
         env_name,
         seed=0,
         steps_per_epoch=4096,
@@ -140,41 +194,19 @@ def train(
         hidden_sizes=[1024, 1024],
         max_ep_len=1000,
         save_freq=10,
-        exp_name='ppo'
-        ):
-    """
-    Train a PPO agent using Stable Baselines 3.
-    
-    Args:
-        env_name (str): Gymnasium environment name
-        seed (int): Random seed
-        steps_per_epoch (int): Number of steps per epoch
-        epochs (int): Number of epochs
-        gamma (float): Discount factor
-        clip_ratio (float): PPO clip ratio
-        pi_lr (float): Learning rate
-        hidden_sizes (list): Sizes of hidden layers
-        max_ep_len (int): Maximum episode length
-        save_freq (int): How often to save the model
-        exp_name (str): Experiment name for logging
-    """
-    # Set random seeds
+        exp_name='dyna_ppo',
+        rollout_horizon=5
+):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # Create environment
     env = gymnasium.make(env_name)
-    env = DummyVecEnv([lambda: env])  # SB3 requires vectorized environments
-    env.start_time = time.time()  # Add start time to env for logging
+    env = DummyVecEnv([lambda: env])
+    env.start_time = time.time()
     
-    # Initialize metrics logger
     metrics_logger = MetricsLogger(exp_name, env_name)
-    
-    # Create eval environment for callbacks
-    eval_env = gymnasium.make(env_name)
-    eval_env = DummyVecEnv([lambda: eval_env])
-    
-    # Create callbacks
+    eval_env = DummyVecEnv([lambda: gymnasium.make(env_name)])
+
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=metrics_logger.save_dir,
@@ -183,15 +215,14 @@ def train(
         deterministic=True,
         render=False
     )
-    
+
     reward_callback = RewardCallback(metrics_logger)
 
-    # Create PPO model
     policy_kwargs = dict(
         net_arch=dict(pi=hidden_sizes, vf=hidden_sizes)
     )
-    
-    model = PPO(
+
+    ppo_policy = PPO(
         "MlpPolicy",
         env,
         learning_rate=pi_lr,
@@ -206,30 +237,64 @@ def train(
         verbose=1
     )
 
-    # Train the agent
-    total_timesteps = steps_per_epoch * epochs
-    
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=[eval_callback, reward_callback],
-        progress_bar=True,
-        log_interval=1 
+    dynamics_model = DynamicsModel(
+        state_dim=env.observation_space.shape[0],
+        action_dim=env.action_space.shape[0]
     )
 
-    # Save the final model
-    model.save(os.path.join(metrics_logger.save_dir, f"PPO_{env_name}_final"))
-    
-    # Save final metrics
+    total_timesteps = steps_per_epoch * epochs
+    real_buffer = ReplayBuffer(
+        buffer_size=100000,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device="cpu"
+    )
+
+    for iteration in range(epochs):
+        print(f"Iteration {iteration + 1}/{epochs}")
+        
+        # Train PPO on real data
+        ppo_policy.learn(
+            total_timesteps=steps_per_epoch,
+            callback=[eval_callback, reward_callback],
+            progress_bar=True
+        )
+        
+        # Collect real data
+        obs = env.reset()
+        for _ in range(steps_per_epoch):
+            action, _ = ppo_policy.predict(obs)
+            next_obs, reward, done, _ = env.step(action)
+            real_buffer.add(obs, next_obs, action, reward, done)
+            obs = next_obs if not done else env.reset()
+        
+        # Train dynamics model
+        real_data = (
+            real_buffer.observations,
+            real_buffer.actions,
+            real_buffer.next_observations
+        )
+        train_dynamics_model(dynamics_model, real_data)
+        
+        # Generate synthetic data
+        synthetic_states, synthetic_actions, synthetic_next_states = generate_synthetic_rollouts(
+            dynamics_model, real_buffer, ppo_policy, rollout_horizon
+        )
+        
+        # Augment buffer with synthetic data
+        for s, a, ns in zip(synthetic_states, synthetic_actions, synthetic_next_states):
+            real_buffer.add(s, ns, a, 0, False)
+
+    ppo_policy.save(os.path.join(metrics_logger.save_dir, f"Dyna_PPO_{env_name}_final"))
     metrics_logger.save_metrics()
-    
-    # Evaluate the trained agent
+
     mean_reward, std_reward = evaluate_policy(
-        model, 
-        eval_env, 
+        ppo_policy,
+        eval_env,
         n_eval_episodes=10,
         deterministic=True
     )
-    
+
     print(f"\nTraining completed in {time.time() - env.start_time:.2f}s")
     print(f"Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
     
@@ -245,15 +310,15 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--steps', type=int, default=4000)
-    parser.add_argument('--epochs', type=int, default=500)
-    parser.add_argument('--exp_name', type=str, default='ppo')
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--exp_name', type=str, default='dyna_ppo')
     args = parser.parse_args()
 
-    train(
+    train_dyna_ppo(
         args.env,
-        hidden_sizes=[args.hid]*args.l,
+        hidden_sizes=[args.hid] * args.l,
         exp_name=args.exp_name,
-        gamma=args.gamma, 
+        gamma=args.gamma,
         seed=args.seed,
         steps_per_epoch=args.steps,
         epochs=args.epochs
