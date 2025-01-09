@@ -88,7 +88,7 @@ if __name__ == '__main__':
     VIDEO_DIR = os.path.expanduser("~/CRL/pushing_videos")
     
     # Load policy
-    policy = PPO.load("./pushing/logs/training_logs/models/PPO_001/saved_model_6.zip", device=device)
+    policy = PPO.load("/home/richtsai1103/CRL/src/results/HalfCheetah-v5/dyna_ppo_20250108_231606/best_model.zip", device=device)
     
     # Record and save video
     video_path = record_policy_episodes(policy, VIDEO_DIR, device=device)

@@ -4,6 +4,7 @@
 *.pth
 *.json
 *.zip
+*.npz
 pushing_episodes/
 venv/
 src/pushing
