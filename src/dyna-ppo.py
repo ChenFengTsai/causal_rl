@@ -12,6 +12,7 @@ from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
 from stable_baselines3.common.buffers import ReplayBuffer
 from metrics_logger import MetricsLogger
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.vec_env import VecNormalize
 
 from datetime import datetime
 import os
@@ -226,20 +227,21 @@ def train_dynamics_model(dynamics_model, real_data, metrics_logger, epoch_step, 
 
 def generate_synthetic_rollouts(dynamics_model, buffer, policy, rollout_horizon=5):
     synthetic_states, synthetic_actions, synthetic_next_states = [], [], []
-    for i in range(0, buffer.size(), 20):
-        state = buffer.sample(1).observations[0]
-        for _ in range(rollout_horizon):
-            # # Random action for simplicity
-            # action = np.random.uniform(-1, 1, size=env.action_space.shape)  
-            # Get the most probable action from the policy
-            action, _ = policy.predict(state, deterministic=True)
-            action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-            next_state = dynamics_model(state_tensor, action_tensor).detach().numpy()[0]
-            synthetic_states.append(state)
-            synthetic_actions.append(action)
-            synthetic_next_states.append(next_state)
-            state = next_state
+    state = buffer.sample(1).observations[0]
+    for _ in range(rollout_horizon):
+        # # Random action for simplicity
+        # action = np.random.uniform(-1, 1, size=env.action_space.shape)  
+        # Get the most probable action from the policy
+        
+        action, _ = policy.predict(state, deterministic=True)
+        action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        next_state = dynamics_model(state_tensor, action_tensor).detach().numpy()[0]
+        synthetic_states.append(state)
+        synthetic_actions.append(action)
+        synthetic_next_states.append(next_state)
+        state = next_state
+    
     return np.array(synthetic_states), np.array(synthetic_actions), np.array(synthetic_next_states)
 
 
@@ -276,11 +278,8 @@ class LearningRateDecayCallback(BaseCallback):
 def train_dyna_ppo(
         env_name,
         seed=0,
-        steps_per_epoch=4096,
+        steps_per_epoch=512,
         epochs=100,
-        gamma=0.99,
-        clip_ratio=0.1,
-        hidden_sizes=[1024, 1024],
         save_freq=5,
         exp_name='dyna_ppo',
 ):
@@ -310,30 +309,36 @@ def train_dyna_ppo(
 
 
     # Total timesteps for all epochs
-    total_timesteps = steps_per_epoch * epochs
-    lr_callback = LearningRateDecayCallback(linear_schedule, total_timesteps=total_timesteps, verbose=1)
-    
-    policy_kwargs = dict(
-        net_arch=dict(pi=hidden_sizes, vf=hidden_sizes)
-    )
 
+    # lr_callback = LearningRateDecayCallback(linear_schedule, total_timesteps=total_timesteps, verbose=1)
+    
     # Set up custom logger
     new_logger = configure(folder=metrics_logger.save_dir, format_strings=["stdout", "csv", "tensorboard"])
 
     ppo_policy = PPO(
-        "MlpPolicy",
-        env,
-        learning_rate=0.0003,
-        n_steps=steps_per_epoch,
-        batch_size=64,
-        n_epochs=10,
-        gamma=gamma,
-        clip_range=clip_ratio,
-        policy_kwargs=policy_kwargs,
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=2.0633e-05,
+        n_steps=512,
+        n_epochs=20,
+        gamma=0.98,
+        gae_lambda=0.92,
+        clip_range=0.1,
+        ent_coef=0.000401762,
+        vf_coef=0.58096,
+        max_grad_norm=0.8,
         tensorboard_log=metrics_logger.tensorboard_log,
         seed=seed,
+        policy_kwargs=dict(
+            log_std_init=-2,
+            ortho_init=False,
+            activation_fn=nn.ReLU,
+            net_arch=[dict(pi=[512, 512], vf=[512, 512])]
+        ),
         verbose=1
     )
+    if True:  # normalize=True in OrderedDict
+        env = VecNormalize(env, norm_obs=True, norm_reward=False)
     
     # Assign custom logger to PPO
     ppo_policy.set_logger(new_logger)
@@ -343,22 +348,29 @@ def train_dyna_ppo(
         action_dim=env.action_space.shape[0]
     )
 
-    # total_timesteps = steps_per_epoch * epochs
     real_buffer = ReplayBuffer(
-        buffer_size=10000,
+        buffer_size=30000,
         observation_space=env.observation_space,
         action_space=env.action_space,
         device="cpu"
     )
 
     epoch_step = 0
+    total_timesteps = 1000000
+    total_steps_per_epoch = total_timesteps//epochs
     for iteration in range(epochs):
         print(f"Iteration {iteration + 1}/{epochs}")
         
         # Train PPO on real data
+        # ppo_policy.learn(
+        #     total_timesteps=total_steps_per_epoch,
+        #     callback=[eval_callback, reward_callback, lr_callback],
+        #     progress_bar=True,
+        #     reset_num_timesteps=False,
+        # )
         ppo_policy.learn(
-            total_timesteps=steps_per_epoch,
-            callback=[eval_callback, reward_callback, lr_callback],
+            total_timesteps=total_steps_per_epoch,
+            callback=[eval_callback, reward_callback],
             progress_bar=True,
             reset_num_timesteps=False,
         )
@@ -378,15 +390,61 @@ def train_dyna_ppo(
             real_buffer.actions,
             real_buffer.next_observations
         )
-        print(real_buffer.observations)
+        # print(real_buffer.observations)
         
         epoch_step = train_dynamics_model(dynamics_model, real_data, metrics_logger, epoch_step)
         
         
         # # Generate synthetic data
-        # synthetic_states, synthetic_actions, synthetic_next_states = generate_synthetic_rollouts(
-        #     dynamics_model, real_buffer, ppo_policy, rollout_horizon
-        # )
+        # for i in range(10):
+        #     synthetic_states, synthetic_actions, synthetic_next_states = generate_synthetic_rollouts(
+        #         dynamics_model, real_buffer, ppo_policy, rollout_horizon=512
+        #     )
+            
+        #     try:
+        #         synthetic_rewards = [env.compute_reward(s, a, ns) for s, a, ns in zip(synthetic_states, synthetic_actions, synthetic_next_states)]
+        #     except AttributeError:
+        #         synthetic_rewards = np.zeros(len(synthetic_states))
+        #         print('Reward function is not valid')
+                
+        #     synthetic_dones = np.zeros(len(synthetic_states), dtype=bool) 
+            
+        #     device = next(ppo_policy.policy.parameters()).device
+        #     ppo_policy.rollout_buffer.reset()
+        #     for state, action, reward, done in zip(synthetic_states, synthetic_actions, synthetic_rewards, synthetic_dones):
+        #         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+        #         action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0).to(device)
+        #         # synthetic_states_tensor = torch.tensor(synthetic_states, dtype=torch.float32).to(device)
+  
+                
+        #         reward_tensor = torch.tensor(reward, dtype=torch.float32).to(device)
+        #         done_tensor = torch.tensor(done, dtype=torch.bool).to(device)
+        #         value_tensor, log_prob_tensor, _ = ppo_policy.policy.evaluate_actions(state_tensor, action_tensor)
+        #         value_tensor = value_tensor.detach().to(device)
+        #         log_prob_tensor = log_prob_tensor.detach().to(device)
+
+                
+        #         ppo_policy.rollout_buffer.add(
+        #             state_tensor.cpu().numpy(),
+        #             action_tensor.cpu().numpy(),
+        #             reward_tensor.cpu().numpy(),
+        #             done_tensor.cpu().numpy(),
+        #             value_tensor.cpu(),
+        #             log_prob_tensor.cpu()
+        #         )
+                
+        #     last_values = ppo_policy.policy.predict_values(torch.tensor(synthetic_states[-1:], dtype=torch.float32).to(device)).detach().to(device)
+        #     ppo_policy.rollout_buffer.compute_returns_and_advantage(
+        #         last_values=last_values,
+        #         dones=synthetic_dones[-1:],
+        #     )
+
+        #     ppo_policy.train()
+        # ppo_policy.rollout_buffer.reset()
+
+
+
+        
         
         # # Augment buffer with synthetic data
         # for s, a, ns in zip(synthetic_states, synthetic_actions, synthetic_next_states):
@@ -412,20 +470,15 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='HalfCheetah-v5')
-    parser.add_argument('--hid', type=int, default=512)
-    parser.add_argument('--l', type=int, default=2)
-    parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--steps', type=int, default=4000)
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--steps', type=int, default=512)
+    parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--exp_name', type=str, default='dyna_ppo')
     args = parser.parse_args()
 
     train_dyna_ppo(
         args.env,
-        hidden_sizes=[args.hid] * args.l,
         exp_name=args.exp_name,
-        gamma=args.gamma,
         seed=args.seed,
         steps_per_epoch=args.steps,
         epochs=args.epochs
