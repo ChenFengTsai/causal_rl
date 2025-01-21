@@ -18,6 +18,9 @@ from datetime import datetime
 import os
 from torch.utils.tensorboard import SummaryWriter
 
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 class MetricsLogger:
     def __init__(self, exp_name, env_name, tensorboard_log=None):
         self.exp_name = exp_name
@@ -165,6 +168,46 @@ class CustomSmoothL1Loss(nn.Module):
         # Return mean loss (same as original SmoothL1Loss)
         return torch.mean(element_wise_losses)
     
+    
+
+class ModifiedEnv(gymnasium.Env):
+    def __init__(self, original_env, extra_feature_dim, dynamics_model):
+        self.original_env = original_env
+        self.extra_feature_dim = extra_feature_dim
+        self.dynamics_model = dynamics_model
+        
+        # Update observation space
+        original_obs_space = original_env.observation_space
+        self.observation_space = gymnasium.spaces.Box(
+            low=np.hstack((original_obs_space.low, [-np.inf] * extra_feature_dim)),
+            high=np.hstack((original_obs_space.high, [np.inf] * extra_feature_dim)),
+            dtype=np.float32
+        )
+        self.action_space = original_env.action_space
+
+    def reset(self, seed=None, options=None):
+        obs, info = self.original_env.reset(seed=seed, options=options)
+        extra_feature = self._generate_extra_feature(obs, np.zeros(self.action_space.shape))
+        combined_obs = np.hstack((obs, extra_feature))
+        return combined_obs, info
+    
+    def step(self, action):
+        obs, reward, done, truncated, info = self.original_env.step(action)
+        extra_feature = self._generate_extra_feature(obs, action) 
+        combined_obs = np.hstack((obs, extra_feature))
+        return combined_obs, reward, done, truncated, info
+
+
+    def _generate_extra_feature(self, obs, action):
+        # Convert state and action to tensors
+        state_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+        action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0).to(device)
+        next_state_pred = self.dynamics_model(state_tensor, action_tensor)
+        return next_state_pred
+
+
+
+
 # Dynamics Model
 class DynamicsModel(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=1024):
@@ -184,45 +227,46 @@ class DynamicsModel(nn.Module):
         return self.model(x)
 
 
-def train_dynamics_model(dynamics_model, real_data, metrics_logger, epoch_step, epochs=20, batch_size=64, lr=1e-3):
+def train_dynamics_model(dynamics_model, real_data, metrics_logger, iteration, real_dim, batch_size=256, lr=1e-3):
     optimizer = torch.optim.Adam(dynamics_model.parameters(), lr=lr)
     # loss_fn = nn.MSELoss()
     loss_fn = CustomSmoothL1Loss()
     # loss_fn = nn.SmoothL1Loss()
 
     states, actions, next_states = real_data
-    states = torch.tensor(states, dtype=torch.float32)
-    actions = torch.tensor(actions, dtype=torch.float32)
-    next_states = torch.tensor(next_states, dtype=torch.float32)
+    states = torch.tensor(states.squeeze(1)[:, :real_dim], dtype=torch.float32).to(device)
+    actions = torch.tensor(actions, dtype=torch.float32).to(device)
+    next_states = torch.tensor(next_states.squeeze(1)[:, :real_dim], dtype=torch.float32).to(device)
 
     dataset = torch.utils.data.TensorDataset(states, actions, next_states)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    for epoch in range(epochs):
-        for i, (batch_states, batch_actions, batch_next_states) in enumerate(dataloader):
-            predictions = dynamics_model(batch_states, batch_actions)
-            loss = loss_fn(predictions, batch_next_states.squeeze(1))
-            
-            
-            optimizer.zero_grad()
-            loss.backward()
-            
-            # Apply gradient clipping
-            torch.nn.utils.clip_grad_norm_(dynamics_model.parameters(), max_norm=1.0)
-            optimizer.step()
-            
-            # Log loss every N batches or at the end of each epoch
-            if i % 500000 == 0:  # Adjust logging frequency as needed
-                # Log loss every few batches
-                print('pred:', predictions, predictions.shape)
-                print('real:', batch_next_states.squeeze(1), batch_next_states.squeeze(1).shape)
-                step = epoch * len(dataloader) + i
-                epoch_step += step
-                print("dynamics model loss:",loss.item())
-                print("dynamics model epoch:", epoch_step)
-                print("dynamics model max loss:", loss_fn.max_loss)
-                metrics_logger.log_metrics({"DynamicsModel/Loss": loss.item()}, epoch_step)
-    return epoch_step
+
+    for i, (batch_states, batch_actions, batch_next_states) in enumerate(dataloader):
+        # Move the batch to the correct device
+        batch_states = batch_states.to(device)
+        batch_actions = batch_actions.to(device)
+        batch_next_states = batch_next_states.to(device)
+        
+        predictions = dynamics_model(batch_states, batch_actions)
+        loss = loss_fn(predictions, batch_next_states.squeeze(1))
+        
+        
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Apply gradient clipping
+        torch.nn.utils.clip_grad_norm_(dynamics_model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        # Log loss every N batches or at the end of each epoch
+        if i % 5000 == 0:  # Adjust logging frequency as needed
+            # Log loss every few batches
+            print('pred:', predictions, predictions.shape)
+            print('real:', batch_next_states.squeeze(1), batch_next_states.squeeze(1).shape)
+            print("dynamics model loss:",loss.item())
+            print("dynamics model max loss:", loss_fn.max_loss)
+            metrics_logger.log_metrics({"DynamicsModel/Loss": loss.item()}, iteration)
 
 
 def generate_synthetic_rollouts(dynamics_model, buffer, policy, rollout_horizon=5):
@@ -245,70 +289,79 @@ def generate_synthetic_rollouts(dynamics_model, buffer, policy, rollout_horizon=
     return np.array(synthetic_states), np.array(synthetic_actions), np.array(synthetic_next_states)
 
 
-def linear_schedule(progress_remaining, log_interval = 1000):
-    if int(progress_remaining * 1e6) % log_interval == 0:
-        print(f"Progress remaining: {progress_remaining:.6f}")
-    return progress_remaining * 0.0003
+# def linear_schedule(progress_remaining, log_interval = 1000):
+#     if int(progress_remaining * 1e6) % log_interval == 0:
+#         print(f"Progress remaining: {progress_remaining:.6f}")
+#     return progress_remaining * 0.0003
 
-class LearningRateDecayCallback(BaseCallback):
-    def __init__(self, schedule, total_timesteps, verbose=0):
-        super().__init__(verbose)
-        self.schedule = schedule
-        self.total_timesteps = total_timesteps
+# class LearningRateDecayCallback(BaseCallback):
+#     def __init__(self, schedule, total_timesteps, verbose=0):
+#         super().__init__(verbose)
+#         self.schedule = schedule
+#         self.total_timesteps = total_timesteps
 
-    def _on_step(self) -> bool:
-        # Calculate progress over the entire training process
-        progress = 1 - (self.num_timesteps / self.total_timesteps)
-        new_lr = self.schedule(progress)
+#     def _on_step(self) -> bool:
+#         # Calculate progress over the entire training process
+#         progress = 1 - (self.num_timesteps / self.total_timesteps)
+#         new_lr = self.schedule(progress)
         
-        # Update the optimizer's learning rate
-        for param_group in self.model.policy.optimizer.param_groups:
-            param_group['lr'] = new_lr
+#         # Update the optimizer's learning rate
+#         for param_group in self.model.policy.optimizer.param_groups:
+#             param_group['lr'] = new_lr
             
-        # Log the new learning rate to TensorBoard
-        self.logger.record('train/learning_rate', new_lr)
+#         # Log the new learning rate to TensorBoard
+#         self.logger.record('train/learning_rate', new_lr)
         
-        if self.verbose > 0 and self.n_calls % 1000 == 0:
-            print(f"[Callback] Updated learning rate to {new_lr}")
+#         if self.verbose > 0 and self.n_calls % 1000 == 0:
+#             print(f"[Callback] Updated learning rate to {new_lr}")
         
-        return True
+#         return True
 
 
 # Modified train function
 def train_dyna_ppo(
         env_name,
         seed=0,
-        steps_per_epoch=512,
-        epochs=100,
-        save_freq=5,
+        epochs=20,
+        save_freq=3,
         exp_name='dyna_ppo',
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
-
-    env = gymnasium.make(env_name)
-    env = DummyVecEnv([lambda: env])
-    env.start_time = time.time()
+    # Initialize dynamics model
+    original_env = gymnasium.make(env_name)
     
+    dynamics_model = DynamicsModel(
+        state_dim=original_env.observation_space.shape[0],
+        action_dim=original_env.action_space.shape[0]
+    ).to(device)
+    
+    # Create the environment with the dynamics model
+    env = ModifiedEnv(original_env, extra_feature_dim=17, dynamics_model=dynamics_model)
+    env = DummyVecEnv([lambda: env])
+
+    
+    # Total timesteps for all epochs
+    total_timesteps = 1000000
+    total_steps_per_epoch = total_timesteps//epochs
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     # Logging setup
     exp_directory = f"{exp_name}_{current_time}"
     metrics_logger = MetricsLogger(exp_directory, env_name)
-    eval_env = DummyVecEnv([lambda: gymnasium.make(env_name)])
-
+    eval_env = DummyVecEnv([lambda: ModifiedEnv(gymnasium.make(env_name), extra_feature_dim=17, dynamics_model=dynamics_model)])
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False)
+    
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=metrics_logger.save_dir,
         log_path=metrics_logger.tensorboard_log,
-        eval_freq=save_freq * steps_per_epoch,
+        eval_freq=save_freq * total_steps_per_epoch,
         deterministic=True,
         render=False
     )
 
     reward_callback = RewardCallback(metrics_logger)
-
-
-    # Total timesteps for all epochs
 
     # lr_callback = LearningRateDecayCallback(linear_schedule, total_timesteps=total_timesteps, verbose=1)
     
@@ -337,27 +390,20 @@ def train_dyna_ppo(
         ),
         verbose=1
     )
-    if True:  # normalize=True in OrderedDict
-        env = VecNormalize(env, norm_obs=True, norm_reward=False)
+
+    env = VecNormalize(env, norm_obs=True, norm_reward=False)
     
     # Assign custom logger to PPO
     ppo_policy.set_logger(new_logger)
 
-    dynamics_model = DynamicsModel(
-        state_dim=env.observation_space.shape[0],
-        action_dim=env.action_space.shape[0]
-    )
 
     real_buffer = ReplayBuffer(
-        buffer_size=30000,
+        buffer_size=10000,
         observation_space=env.observation_space,
         action_space=env.action_space,
         device="cpu"
     )
 
-    epoch_step = 0
-    total_timesteps = 1000000
-    total_steps_per_epoch = total_timesteps//epochs
     for iteration in range(epochs):
         print(f"Iteration {iteration + 1}/{epochs}")
         
@@ -377,10 +423,13 @@ def train_dyna_ppo(
         
         # Collect real data
         obs = env.reset()
-        for _ in range(steps_per_epoch):
+        dynamics_training_data = int(total_steps_per_epoch*0.1)
+        for _ in range(dynamics_training_data):
             action, _ = ppo_policy.predict(obs)
             next_obs, reward, done, infos = env.step(action)
-            real_buffer.add(obs, next_obs, action, reward, done, infos)
+
+            
+            real_buffer.add(obs[0], next_obs[0], action[0], reward, done, infos)
             # obs = next_obs if not done else env.reset()
             obs = next_obs
         
@@ -390,67 +439,14 @@ def train_dyna_ppo(
             real_buffer.actions,
             real_buffer.next_observations
         )
+        
         # print(real_buffer.observations)
+        real_dim = original_env.observation_space.shape[0]
+        train_dynamics_model(dynamics_model, real_data, metrics_logger, iteration, real_dim)
         
-        epoch_step = train_dynamics_model(dynamics_model, real_data, metrics_logger, epoch_step)
-        
-        
-        # # Generate synthetic data
-        # for i in range(10):
-        #     synthetic_states, synthetic_actions, synthetic_next_states = generate_synthetic_rollouts(
-        #         dynamics_model, real_buffer, ppo_policy, rollout_horizon=512
-        #     )
-            
-        #     try:
-        #         synthetic_rewards = [env.compute_reward(s, a, ns) for s, a, ns in zip(synthetic_states, synthetic_actions, synthetic_next_states)]
-        #     except AttributeError:
-        #         synthetic_rewards = np.zeros(len(synthetic_states))
-        #         print('Reward function is not valid')
-                
-        #     synthetic_dones = np.zeros(len(synthetic_states), dtype=bool) 
-            
-        #     device = next(ppo_policy.policy.parameters()).device
-        #     ppo_policy.rollout_buffer.reset()
-        #     for state, action, reward, done in zip(synthetic_states, synthetic_actions, synthetic_rewards, synthetic_dones):
-        #         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-        #         action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0).to(device)
-        #         # synthetic_states_tensor = torch.tensor(synthetic_states, dtype=torch.float32).to(device)
-  
-                
-        #         reward_tensor = torch.tensor(reward, dtype=torch.float32).to(device)
-        #         done_tensor = torch.tensor(done, dtype=torch.bool).to(device)
-        #         value_tensor, log_prob_tensor, _ = ppo_policy.policy.evaluate_actions(state_tensor, action_tensor)
-        #         value_tensor = value_tensor.detach().to(device)
-        #         log_prob_tensor = log_prob_tensor.detach().to(device)
 
-                
-        #         ppo_policy.rollout_buffer.add(
-        #             state_tensor.cpu().numpy(),
-        #             action_tensor.cpu().numpy(),
-        #             reward_tensor.cpu().numpy(),
-        #             done_tensor.cpu().numpy(),
-        #             value_tensor.cpu(),
-        #             log_prob_tensor.cpu()
-        #         )
-                
-        #     last_values = ppo_policy.policy.predict_values(torch.tensor(synthetic_states[-1:], dtype=torch.float32).to(device)).detach().to(device)
-        #     ppo_policy.rollout_buffer.compute_returns_and_advantage(
-        #         last_values=last_values,
-        #         dones=synthetic_dones[-1:],
-        #     )
-
-        #     ppo_policy.train()
-        # ppo_policy.rollout_buffer.reset()
-
-
-
-        
-        
-        # # Augment buffer with synthetic data
-        # for s, a, ns in zip(synthetic_states, synthetic_actions, synthetic_next_states):
-        #     real_buffer.add(s, ns, a, 0, False, [{}])
-
-    ppo_policy.save(os.path.join(metrics_logger.save_dir, f"Dyna_PPO_{env_name}_final"))
+    ppo_policy.save(os.path.join(metrics_logger.save_dir, f"PPO_{env_name}_final"))
+    torch.save(dynamics_model.state_dict(), os.path.join(metrics_logger.save_dir, f"Dyna_{env_name}_final"))
 
 
     mean_reward, std_reward = evaluate_policy(
@@ -460,7 +456,7 @@ def train_dyna_ppo(
         deterministic=True
     )
 
-    print(f"\nTraining completed in {time.time() - env.start_time:.2f}s")
+    # print(f"\nTraining completed in {time.time() - env.start_time:.2f}s")
     print(f"Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
     
     env.close()
@@ -471,8 +467,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='HalfCheetah-v5')
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--steps', type=int, default=512)
-    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--exp_name', type=str, default='dyna_ppo')
     args = parser.parse_args()
 
@@ -480,6 +475,5 @@ if __name__ == '__main__':
         args.env,
         exp_name=args.exp_name,
         seed=args.seed,
-        steps_per_epoch=args.steps,
         epochs=args.epochs
     )
