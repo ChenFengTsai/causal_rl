@@ -171,10 +171,11 @@ class CustomSmoothL1Loss(nn.Module):
     
 
 class ModifiedEnv(gymnasium.Env):
-    def __init__(self, original_env, extra_feature_dim, dynamics_model):
+    def __init__(self, original_env, extra_feature_dim, dynamics_model, policy):
         self.original_env = original_env
         self.extra_feature_dim = extra_feature_dim
         self.dynamics_model = dynamics_model
+        self.policy = policy  # Add the policy to the environment
         
         # Update observation space
         original_obs_space = original_env.observation_space
@@ -188,13 +189,43 @@ class ModifiedEnv(gymnasium.Env):
     def reset(self, seed=None, options=None):
         obs, info = self.original_env.reset(seed=seed, options=options)
         extra_feature = self._generate_extra_feature(obs, np.zeros(self.action_space.shape))
+        extra_feature = extra_feature.detach().cpu().numpy()[0]
         combined_obs = np.hstack((obs, extra_feature))
+        self.current_obs = obs
         return combined_obs, info
     
+    # def step(self, action):
+    #     obs, reward, done, truncated, info = self.original_env.step(action)
+    #     extra_feature = self._generate_extra_feature(obs, action) 
+    #     extra_feature = extra_feature.detach().cpu().numpy()[0]
+    #     combined_obs = np.hstack((obs, extra_feature))
+    #     return combined_obs, reward, done, truncated, info
+    
+
     def step(self, action):
-        obs, reward, done, truncated, info = self.original_env.step(action)
-        extra_feature = self._generate_extra_feature(obs, action) 
-        combined_obs = np.hstack((obs, extra_feature))
+        # Step the environment and get the next observation
+        next_obs, reward, done, truncated, info = self.original_env.step(action)
+
+        # Generate the extra feature based on the current observation and action
+        peek_feature = self._generate_extra_feature(self.current_obs, action)
+        peek_feature = peek_feature.detach().cpu().numpy()[0]
+
+        # Combine the current observation with the extra feature to form the augmented observation
+        augmented_obs = np.hstack((self.current_obs, peek_feature))
+
+        # Use the augmented observation to predict the next action
+        predicted_action, _ = self.policy.predict(augmented_obs, deterministic=True)
+
+        # Generate the extra feature for the next observation
+        next_peek_feature = self._generate_extra_feature(next_obs, predicted_action)
+        next_peek_feature = next_peek_feature.detach().cpu().numpy()[0]
+
+        # Combine the next observation with the next extra feature
+        combined_obs = np.hstack((next_obs, next_peek_feature))
+
+        # Update the current observation for the next step
+        self.current_obs = next_obs
+
         return combined_obs, reward, done, truncated, info
 
 
@@ -262,31 +293,29 @@ def train_dynamics_model(dynamics_model, real_data, metrics_logger, iteration, r
         # Log loss every N batches or at the end of each epoch
         if i % 5000 == 0:  # Adjust logging frequency as needed
             # Log loss every few batches
-            print('pred:', predictions, predictions.shape)
-            print('real:', batch_next_states.squeeze(1), batch_next_states.squeeze(1).shape)
             print("dynamics model loss:",loss.item())
             print("dynamics model max loss:", loss_fn.max_loss)
             metrics_logger.log_metrics({"DynamicsModel/Loss": loss.item()}, iteration)
 
 
-def generate_synthetic_rollouts(dynamics_model, buffer, policy, rollout_horizon=5):
-    synthetic_states, synthetic_actions, synthetic_next_states = [], [], []
-    state = buffer.sample(1).observations[0]
-    for _ in range(rollout_horizon):
-        # # Random action for simplicity
-        # action = np.random.uniform(-1, 1, size=env.action_space.shape)  
-        # Get the most probable action from the policy
+# def generate_synthetic_rollouts(dynamics_model, buffer, policy, rollout_horizon=5):
+#     synthetic_states, synthetic_actions, synthetic_next_states = [], [], []
+#     state = buffer.sample(1).observations[0]
+#     for _ in range(rollout_horizon):
+#         # # Random action for simplicity
+#         # action = np.random.uniform(-1, 1, size=env.action_space.shape)  
+#         # Get the most probable action from the policy
         
-        action, _ = policy.predict(state, deterministic=True)
-        action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        next_state = dynamics_model(state_tensor, action_tensor).detach().numpy()[0]
-        synthetic_states.append(state)
-        synthetic_actions.append(action)
-        synthetic_next_states.append(next_state)
-        state = next_state
+#         action, _ = policy.predict(state, deterministic=True)
+#         action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
+#         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+#         next_state = dynamics_model(state_tensor, action_tensor).detach().numpy()[0]
+#         synthetic_states.append(state)
+#         synthetic_actions.append(action)
+#         synthetic_next_states.append(next_state)
+#         state = next_state
     
-    return np.array(synthetic_states), np.array(synthetic_actions), np.array(synthetic_next_states)
+#     return np.array(synthetic_states), np.array(synthetic_actions), np.array(synthetic_next_states)
 
 
 # def linear_schedule(progress_remaining, log_interval = 1000):
@@ -323,7 +352,7 @@ def train_dyna_ppo(
         env_name,
         seed=0,
         epochs=20,
-        save_freq=3,
+        save_freq=1,
         exp_name='dyna_ppo',
 ):
     torch.manual_seed(seed)
@@ -336,11 +365,6 @@ def train_dyna_ppo(
         action_dim=original_env.action_space.shape[0]
     ).to(device)
     
-    # Create the environment with the dynamics model
-    env = ModifiedEnv(original_env, extra_feature_dim=17, dynamics_model=dynamics_model)
-    env = DummyVecEnv([lambda: env])
-
-    
     # Total timesteps for all epochs
     total_timesteps = 1000000
     total_steps_per_epoch = total_timesteps//epochs
@@ -349,18 +373,6 @@ def train_dyna_ppo(
     # Logging setup
     exp_directory = f"{exp_name}_{current_time}"
     metrics_logger = MetricsLogger(exp_directory, env_name)
-    eval_env = DummyVecEnv([lambda: ModifiedEnv(gymnasium.make(env_name), extra_feature_dim=17, dynamics_model=dynamics_model)])
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False)
-    
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=metrics_logger.save_dir,
-        log_path=metrics_logger.tensorboard_log,
-        eval_freq=save_freq * total_steps_per_epoch,
-        deterministic=True,
-        render=False
-    )
-
     reward_callback = RewardCallback(metrics_logger)
 
     # lr_callback = LearningRateDecayCallback(linear_schedule, total_timesteps=total_timesteps, verbose=1)
@@ -368,9 +380,15 @@ def train_dyna_ppo(
     # Set up custom logger
     new_logger = configure(folder=metrics_logger.save_dir, format_strings=["stdout", "csv", "tensorboard"])
 
+    # Initialize the environment
+    env = ModifiedEnv(original_env, extra_feature_dim=17, dynamics_model=dynamics_model, policy=None)
+    env = DummyVecEnv([lambda: env])
+    env = VecNormalize(env, norm_obs=True, norm_reward=False)
+
+    # Initialize the PPO policy with the environment
     ppo_policy = PPO(
         policy="MlpPolicy",
-        env=env,
+        env=env,  # Pass the environment here
         learning_rate=2.0633e-05,
         n_steps=512,
         n_epochs=20,
@@ -391,11 +409,31 @@ def train_dyna_ppo(
         verbose=1
     )
 
-    env = VecNormalize(env, norm_obs=True, norm_reward=False)
-    
+    # Pass the policy to the ModifiedEnv
+    env.envs[0].policy = ppo_policy
+
     # Assign custom logger to PPO
     ppo_policy.set_logger(new_logger)
 
+    
+    # Create the evaluation environment
+    eval_env = DummyVecEnv([lambda: ModifiedEnv(
+        gymnasium.make(env_name),
+        extra_feature_dim=17,
+        dynamics_model=dynamics_model,
+        policy=ppo_policy
+    )])
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False)
+
+    # Callbacks
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=metrics_logger.save_dir,
+        log_path=metrics_logger.tensorboard_log,
+        eval_freq=save_freq * (1000000 // epochs),
+        deterministic=True,
+        render=False
+    )
 
     real_buffer = ReplayBuffer(
         buffer_size=10000,
@@ -446,7 +484,7 @@ def train_dyna_ppo(
         
 
     ppo_policy.save(os.path.join(metrics_logger.save_dir, f"PPO_{env_name}_final"))
-    torch.save(dynamics_model.state_dict(), os.path.join(metrics_logger.save_dir, f"Dyna_{env_name}_final"))
+    torch.save(dynamics_model.state_dict(), os.path.join(metrics_logger.save_dir, f"Dyna_{env_name}_final.pth"))
 
 
     mean_reward, std_reward = evaluate_policy(
