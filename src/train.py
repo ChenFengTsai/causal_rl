@@ -13,10 +13,11 @@ from metrics_logger import MetricsLogger
 from reward_callback import RewardCallback
 from dynamics_model import DynamicsModel, train_dynamics_model
 from environment import ModifiedEnv
+import json
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def train_dyna_ppo(env_name, seed=0, epochs=20, save_freq=1, exp_name='dyna_ppo'):
+def train_dyna_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_name='dyna_ppo'):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -27,7 +28,6 @@ def train_dyna_ppo(env_name, seed=0, epochs=20, save_freq=1, exp_name='dyna_ppo'
         action_dim=original_env.action_space.shape[0]
     ).to(device)
 
-    total_timesteps = 1000000
     total_steps_per_epoch = total_timesteps // epochs
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     
@@ -38,13 +38,12 @@ def train_dyna_ppo(env_name, seed=0, epochs=20, save_freq=1, exp_name='dyna_ppo'
     new_logger = configure(folder=metrics_logger.save_dir, format_strings=["stdout", "csv", "tensorboard"])
 
     # decide how many extra feature 
-    extra_same_dim = False
-    if extra_same_dim:
+    reduce_feature = False
+    if not reduce_feature:
         extra_feature_dim = original_env.observation_space.shape[0]
     else:
-        extra_feature_dim = original_env.observation_space.shape[0] // 10 # modified this if you want
+        extra_feature_dim = original_env.observation_space.shape[0] // 3 # modified this if you want
         
-    reduce_feature = True
     env = ModifiedEnv(original_env, 
                       extra_feature_dim=extra_feature_dim, 
                       dynamics_model=dynamics_model, 
@@ -53,26 +52,57 @@ def train_dyna_ppo(env_name, seed=0, epochs=20, save_freq=1, exp_name='dyna_ppo'
     env = DummyVecEnv([lambda: env])
     env = VecNormalize(env, norm_obs=True, norm_reward=False)
 
+    hyperparameters = {
+        "env_name": env_name,
+        "learning_rate": 2.0633e-05,
+        "n_steps": 512,
+        "batch_size": 256,
+        "n_epochs": 20,
+        "gamma": 0.98,
+        "gae_lambda": 0.92,
+        "clip_range": 0.1,
+        "ent_coef": 0.000401762,
+        "vf_coef": 0.58096,
+        "max_grad_norm": 0.5,
+        "policy_kwargs": {
+            "log_std_init": -2,
+            "ortho_init": True,
+            "activation_fn": "Tanh",
+            "net_arch": [{"pi": [512, 512], "vf": [512, 512]}],
+        },
+        "total_timesteps": total_timesteps,
+        "epochs": epochs,
+        "seed": seed,
+    }
+
+    # Save hyperparameters as JSON
+    hyperparam_path = os.path.join(metrics_logger.save_dir, "hyperparameters.json")
+    with open(hyperparam_path, "w") as f:
+        json.dump(hyperparameters, f, indent=4)
+
+    print(f"Saved hyperparameters to {hyperparam_path}")
+    
+    # Load hyperparameters from JSON
+    with open(hyperparam_path, "r") as f:
+        loaded_hyperparameters = json.load(f)
+        
+    # Convert activation function from string to actual function
+    if "policy_kwargs" in loaded_hyperparameters and "activation_fn" in loaded_hyperparameters["policy_kwargs"]:
+        loaded_hyperparameters["policy_kwargs"]["activation_fn"] = getattr(torch.nn, loaded_hyperparameters["policy_kwargs"]["activation_fn"].split('.')[-1])
+        
+    if "policy_kwargs" in loaded_hyperparameters and "net_arch" in loaded_hyperparameters["policy_kwargs"]:
+        loaded_hyperparameters["policy_kwargs"]["net_arch"] = [
+            dict(pi=loaded_hyperparameters["policy_kwargs"]["net_arch"][0]["pi"],
+            vf=loaded_hyperparameters["policy_kwargs"]["net_arch"][0]["vf"])
+        ]
+
+    # Remove unnecessary keys before passing into PPO
+    ppo_params = {k: v for k, v in loaded_hyperparameters.items() if k not in ["env_name", "total_timesteps", "epochs", "seed"]}
     ppo_policy = PPO(
         policy="MlpPolicy",
         env=env,
-        learning_rate=2.0633e-05,
-        n_steps=512,
-        n_epochs=20,
-        gamma=0.98,
-        gae_lambda=0.92,
-        clip_range=0.1,
-        ent_coef=0.000401762,
-        vf_coef=0.58096,
-        max_grad_norm=0.8,
-        tensorboard_log=metrics_logger.tensorboard_log,
+        **ppo_params,  # Load hyperparameters dynamically
         seed=seed,
-        policy_kwargs=dict(
-            log_std_init=-2,
-            ortho_init=False,
-            activation_fn=torch.nn.ReLU,
-            net_arch=[dict(pi=[512, 512], vf=[512, 512])]
-        ),
         verbose=1
     )
 

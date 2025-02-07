@@ -5,7 +5,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='Humanoid-v5')
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--total_timesteps', type=int, default=10000000)
     parser.add_argument('--exp_name', type=str, default='dyna_ppo')
     args = parser.parse_args()
 
@@ -13,5 +14,6 @@ if __name__ == '__main__':
         args.env,
         exp_name=args.exp_name,
         seed=args.seed,
-        epochs=args.epochs
+        epochs=args.epochs,
+        total_timesteps=args.total_timesteps
     )

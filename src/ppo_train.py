@@ -12,39 +12,14 @@ from stable_baselines3.common.logger import configure
 from torch.utils.tensorboard import SummaryWriter
 from metrics_logger import MetricsLogger
 from reward_callback import RewardCallback
+import json
 
 
 # Device configuration
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-
-# Callback to log rewards
-# class RewardCallback(BaseCallback):
-#     def __init__(self, metrics_logger, save_every_n_steps=1000):
-#         super().__init__()
-#         self.metrics_logger = metrics_logger
-#         self.episode_rewards = []
-#         self.current_episode_reward = 0
-        
-#     def _on_step(self) -> bool:
-#         reward = self.locals['rewards'][0]
-#         done = self.locals['dones'][0]
-        
-#         self.current_episode_reward += reward
-#         if done:
-#             self.episode_rewards.append(self.current_episode_reward)
-#             self.current_episode_reward = 0
-            
-#             if len(self.episode_rewards) % 5 == 0:
-#                 self.metrics_logger.log_metrics({
-#                     'EpRet': np.mean(self.episode_rewards)
-#                 }, self.num_timesteps)
-#                 self.episode_rewards = []
-        
-#         return True
-
 # PPO training function
-def train_ppo(env_name, seed=0, epochs=20, save_freq=1, exp_name='ppo'):
+def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_name='ppo'):
     torch.manual_seed(seed)
     np.random.seed(seed)
     
@@ -58,33 +33,63 @@ def train_ppo(env_name, seed=0, epochs=20, save_freq=1, exp_name='ppo'):
     reward_callback = RewardCallback(metrics_logger)
     
     new_logger = configure(folder=metrics_logger.save_dir, format_strings=["stdout", "csv", "tensorboard"])
+    # Inside train_ppo function, before initializing PPO
+
+    hyperparameters = {
+        "env_name": env_name,
+        "learning_rate": 3e-5,
+        "n_steps": 2048,
+        "batch_size": 256,
+        "n_epochs": 10,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "clip_range": 0.2,
+        "ent_coef": 0.01,
+        "vf_coef": 0.5,
+        "max_grad_norm": 0.5,
+        "policy_kwargs": {
+            "log_std_init": -2,
+            "ortho_init": True,
+            "activation_fn": "Tanh",
+            "net_arch": [{"pi": [1024, 1024, 512], "vf": [1024, 1024, 512]}],
+        },
+        "total_timesteps": total_timesteps,
+        "epochs": epochs,
+        "seed": seed,
+    }
+
+    # Save hyperparameters as JSON
+    hyperparam_path = os.path.join(metrics_logger.save_dir, "hyperparameters.json")
+    with open(hyperparam_path, "w") as f:
+        json.dump(hyperparameters, f, indent=4)
+
+    print(f"Saved hyperparameters to {hyperparam_path}")
     
+    # Load hyperparameters from JSON
+    with open(hyperparam_path, "r") as f:
+        loaded_hyperparameters = json.load(f)
+        
+    # Convert activation function from string to actual function
+    if "policy_kwargs" in loaded_hyperparameters and "activation_fn" in loaded_hyperparameters["policy_kwargs"]:
+        loaded_hyperparameters["policy_kwargs"]["activation_fn"] = getattr(torch.nn, loaded_hyperparameters["policy_kwargs"]["activation_fn"].split('.')[-1])
+        
+    if "policy_kwargs" in loaded_hyperparameters and "net_arch" in loaded_hyperparameters["policy_kwargs"]:
+        loaded_hyperparameters["policy_kwargs"]["net_arch"] = [
+            dict(pi=loaded_hyperparameters["policy_kwargs"]["net_arch"][0]["pi"],
+            vf=loaded_hyperparameters["policy_kwargs"]["net_arch"][0]["vf"])
+        ]
+
+    # Remove unnecessary keys before passing into PPO
+    ppo_params = {k: v for k, v in loaded_hyperparameters.items() if k not in ["env_name", "total_timesteps", "epochs", "seed"]}
     ppo_policy = PPO(
         policy="MlpPolicy",
         env=env,
-        learning_rate=2.0633e-05,
-        n_steps=512,
-        n_epochs=20,
-        gamma=0.98,
-        gae_lambda=0.92,
-        clip_range=0.1,
-        ent_coef=0.000401762,
-        vf_coef=0.58096,
-        max_grad_norm=0.8,
-        tensorboard_log=metrics_logger.tensorboard_log,
+        **ppo_params,  # Load hyperparameters dynamically
         seed=seed,
-        policy_kwargs=dict(
-            log_std_init=-2,
-            ortho_init=False,
-            activation_fn=nn.ReLU,
-            net_arch=[dict(pi=[512, 512], vf=[512, 512])]
-        ),
         verbose=1
     )
     
     ppo_policy.set_logger(new_logger)
-    
-    total_timesteps = 2000000
     total_steps_per_epoch = total_timesteps // epochs
     
     eval_env = DummyVecEnv([lambda: gymnasium.make(env_name)])
@@ -122,7 +127,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='Humanoid-v5')
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--total_timesteps', type=int, default=10000000)
     parser.add_argument('--exp_name', type=str, default='ppo')
     args = parser.parse_args()
 
@@ -130,5 +136,6 @@ if __name__ == '__main__':
         args.env,
         exp_name=args.exp_name,
         seed=args.seed,
-        epochs=args.epochs
+        epochs=args.epochs,
+        total_timesteps=args.total_timesteps
     )

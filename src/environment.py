@@ -41,19 +41,31 @@ class ModifiedEnv(gymnasium.Env):
         
     def reset(self, seed=None, options=None):
         obs, info = self.original_env.reset(seed=seed, options=options)
-        extra_feature = self._generate_extra_feature(obs, np.zeros(self.action_space.shape))
-        
-        extra_feature = extra_feature.detach().cpu().numpy()
-        combined_obs = np.hstack((obs, extra_feature))
+        peek_feature = self._generate_extra_feature(obs, np.zeros(self.action_space.shape))
 
+        peek_feature = peek_feature.detach().cpu().numpy()
+        if not self.reduce_feature:
+            peek_feature = peek_feature[0]
+
+        combined_obs = np.hstack((obs, peek_feature))
         self.current_obs = obs
+
+        # # Debugging Prints
+        # print("=== RESET ===")
+        # print("Obs shape:", obs.shape)
+        # print("Extra feature shape:", peek_feature.shape)
+        # print("Combined obs shape (reset):", combined_obs.shape)
+
         return combined_obs, info
+
 
     def step(self, action):
         next_obs, reward, done, truncated, info = self.original_env.step(action)
 
         peek_feature = self._generate_extra_feature(self.current_obs, action)
         peek_feature = peek_feature.detach().cpu().numpy()
+        if not self.reduce_feature:
+            peek_feature = peek_feature[0]
 
         augmented_obs = np.hstack((self.current_obs, peek_feature))
 
@@ -61,6 +73,8 @@ class ModifiedEnv(gymnasium.Env):
 
         next_peek_feature = self._generate_extra_feature(next_obs, predicted_action)
         next_peek_feature = next_peek_feature.detach().cpu().numpy()
+        if not self.reduce_feature:
+            next_peek_feature = next_peek_feature[0]
 
         combined_obs = np.hstack((next_obs, next_peek_feature))
 
