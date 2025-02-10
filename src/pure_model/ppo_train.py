@@ -1,40 +1,38 @@
-import gymnasium
-import numpy as np
-import torch
-import torch.nn as nn
 import os
+import sys
 from datetime import datetime
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
-from stable_baselines3.common.logger import configure
+
+import torch
+import numpy as np
 from torch.utils.tensorboard import SummaryWriter
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import EvalCallback
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from utils import make_vec_env, setup_logger, save_hyperparameters, load_hyperparameters, evaluate_model
 from metrics_logger import MetricsLogger
 from reward_callback import RewardCallback
-import json
 
 
-# Device configuration
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# PPO training function
 def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_name='ppo'):
+    # Set seeds
     torch.manual_seed(seed)
     np.random.seed(seed)
-    
-    env = gymnasium.make(env_name)
-    env = DummyVecEnv([lambda: env])
-    env = VecNormalize(env, norm_obs=True, norm_reward=False)
-    
+
+    # Create environments
+    env = make_vec_env(env_name)
+    eval_env = make_vec_env(env_name)
+
+    # Setup logger
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_directory = f"{exp_name}_{current_time}"
+    parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    exp_directory = os.path.join(parent_path, f"results/{env_name}/{exp_name}_{current_time}")
+    logger, exp_directory = setup_logger(exp_directory)
     metrics_logger = MetricsLogger(exp_directory, env_name)
     reward_callback = RewardCallback(metrics_logger)
-    
-    new_logger = configure(folder=metrics_logger.save_dir, format_strings=["stdout", "csv", "tensorboard"])
-    # Inside train_ppo function, before initializing PPO
 
+    # Define hyperparameters
     hyperparameters = {
         "env_name": env_name,
         "learning_rate": 3e-5,
@@ -58,16 +56,10 @@ def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_nam
         "seed": seed,
     }
 
-    # Save hyperparameters as JSON
-    hyperparam_path = os.path.join(metrics_logger.save_dir, "hyperparameters.json")
-    with open(hyperparam_path, "w") as f:
-        json.dump(hyperparameters, f, indent=4)
+    # Save hyperparameters
+    save_hyperparameters(hyperparameters, exp_directory)
 
-    print(f"Saved hyperparameters to {hyperparam_path}")
-    
-    # Load hyperparameters from JSON
-    with open(hyperparam_path, "r") as f:
-        loaded_hyperparameters = json.load(f)
+    loaded_hyperparameters = load_hyperparameters(exp_directory)
         
     # Convert activation function from string to actual function
     if "policy_kwargs" in loaded_hyperparameters and "activation_fn" in loaded_hyperparameters["policy_kwargs"]:
@@ -88,21 +80,20 @@ def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_nam
         seed=seed,
         verbose=1
     )
-    
-    ppo_policy.set_logger(new_logger)
+
+    # Set up logger and evaluation callback
+    ppo_policy.set_logger(logger)
     total_steps_per_epoch = total_timesteps // epochs
-    
-    eval_env = DummyVecEnv([lambda: gymnasium.make(env_name)])
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False)
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=metrics_logger.save_dir,
         log_path=metrics_logger.tensorboard_log,
-        eval_freq=save_freq * (total_steps_per_epoch),
+        eval_freq=save_freq * total_steps_per_epoch,
         deterministic=True,
-        render=False
+        render=False,
     )
-    
+
+    # Training loop
     for iteration in range(epochs):
         print(f"Iteration {iteration + 1}/{epochs}")
         ppo_policy.learn(
@@ -111,19 +102,21 @@ def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_nam
             progress_bar=True,
             reset_num_timesteps=False,
         )
-    
-    ppo_policy.save(os.path.join(metrics_logger.save_dir, f"PPO_{env_name}_final"))
-    
-    mean_reward, std_reward = evaluate_policy(
-        ppo_policy, eval_env, n_eval_episodes=10, deterministic=True
-    )
-    
-    print(f"Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
+
+    # Save the final model
+    ppo_policy.save(f"{metrics_logger.save_dir}/PPO_{env_name}_final")
+
+    # Evaluate the model
+    evaluate_model(ppo_policy, eval_env)
+
+    # Cleanup
     env.close()
     eval_env.close()
 
+
 if __name__ == '__main__':
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='Humanoid-v5')
     parser.add_argument('--seed', '-s', type=int, default=0)
@@ -134,8 +127,8 @@ if __name__ == '__main__':
 
     train_ppo(
         args.env,
-        exp_name=args.exp_name,
+        total_timesteps=args.total_timesteps,
         seed=args.seed,
         epochs=args.epochs,
-        total_timesteps=args.total_timesteps
+        exp_name=args.exp_name
     )
