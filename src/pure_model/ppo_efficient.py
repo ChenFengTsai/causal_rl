@@ -7,13 +7,42 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from utils import make_vec_env, setup_logger, save_hyperparameters, load_hyperparameters, evaluate_model
+from utils import setup_logger, save_hyperparameters, load_hyperparameters, evaluate_model
 from metrics_logger import MetricsLogger
 from reward_callback import RewardCallback
 
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+import gymnasium
 
+
+def make_vec_env(env_name, n_envs=1):
+    """
+    Creates a vectorized environment with multiple parallel environments.
+    """
+    # Define a helper function to create a single environment
+    def make_env_fn(env_id):
+        def _init():
+            env = gymnasium.make(env_id)
+            return env
+        return _init
+
+    # Create a list of environments
+    env_fns = [make_env_fn(env_name) for _ in range(n_envs)]
+
+    # Use SubprocVecEnv for parallel execution
+    if n_envs > 1:
+        env = SubprocVecEnv(env_fns)
+    else:
+        env = DummyVecEnv(env_fns)  # Use DummyVecEnv if only 1 environment
+
+    # Normalize observations and rewards
+    env = VecNormalize(env, norm_obs=True, norm_reward=False)
+
+    return env
+# ppo_20250212_233243, ppo_20250213_133208
 
 def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_name='ppo'):
     # Set seeds
@@ -21,7 +50,8 @@ def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_nam
     np.random.seed(seed)
 
     # Create environments
-    env = make_vec_env(env_name)
+    number_env = 4
+    env = make_vec_env(env_name, n_envs=number_env)
     eval_env = make_vec_env(env_name)
 
     # Setup logger
@@ -55,9 +85,10 @@ def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_nam
         "total_timesteps": total_timesteps,
         "epochs": epochs,
         "seed": seed,
+        "n_envs": number_env
     }
 
-    # Save hyperparameters
+   # Save hyperparameters
     save_hyperparameters(hyperparameters, exp_directory)
 
     loaded_hyperparameters = load_hyperparameters(exp_directory)
@@ -75,7 +106,7 @@ def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_nam
         ]
 
     # Remove unnecessary keys before passing into PPO
-    ppo_params = {k: v for k, v in loaded_hyperparameters.items() if k not in ["env_name", "total_timesteps", "epochs", "seed"]}
+    ppo_params = {k: v for k, v in loaded_hyperparameters.items() if k not in ["env_name", "total_timesteps", "epochs", "seed", "n_envs"]}
     ppo_policy = PPO(
         env=env,
         **ppo_params,  # Load hyperparameters dynamically
@@ -90,7 +121,7 @@ def train_ppo(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_nam
         eval_env,
         best_model_save_path=metrics_logger.save_dir,
         log_path=metrics_logger.tensorboard_log,
-        eval_freq=save_freq * total_steps_per_epoch,
+        eval_freq=(save_freq / number_env) * total_steps_per_epoch,
         deterministic=True,
         render=False,
     )
@@ -123,7 +154,7 @@ if __name__ == '__main__':
     parser.add_argument('--env', type=str, default='Humanoid-v5')
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--total_timesteps', type=int, default=10)
+    parser.add_argument('--total_timesteps', type=int, default=10000000)
     parser.add_argument('--exp_name', type=str, default='ppo')
     args = parser.parse_args()
 

@@ -33,6 +33,7 @@ def train_sac(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_nam
 
     # Define hyperparameters
     hyperparameters = {
+        "policy": "MlpPolicy",
         "env_name": env_name,
         "learning_rate": 3e-4,
         "batch_size": 256,
@@ -60,7 +61,6 @@ def train_sac(env_name, total_timesteps, seed=0, epochs=20, save_freq=1, exp_nam
     sac_params = {k: v for k, v in loaded_hyperparameters.items() if k not in ["env_name", "total_timesteps", "epochs", "seed"]}
     # Initialize SAC model
     sac_policy = SAC(
-        policy="MlpPolicy",
         env=env,
         **sac_params,
         seed=seed,

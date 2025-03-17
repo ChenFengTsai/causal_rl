@@ -58,25 +58,50 @@ class ModifiedEnv(gymnasium.Env):
 
         return combined_obs, info
 
-
+    #look ahead using not the optimal action to create peek feature
+    def step(self, action):
+        next_obs, reward, done, truncated, info = self.original_env.step(action)
+        peek_feature = self._generate_extra_feature(next_obs, action) 
+        peek_feature = peek_feature.detach().cpu().numpy()
+        if not self.reduce_feature:
+            peek_feature = peek_feature[0]
+            
+        combined_obs = np.hstack((next_obs, peek_feature))
+        return combined_obs, reward, done, truncated, info
+    
     def step(self, action):
         next_obs, reward, done, truncated, info = self.original_env.step(action)
 
-        peek_feature = self._generate_extra_feature(self.current_obs, action)
+        predicted_next_obs = self._generate_extra_feature(self.current_obs, action)
+        predicted_next_obs = predicted_next_obs.detach().cpu().numpy()
+        if not self.reduce_feature:
+            predicted_next_obs = predicted_next_obs[0]
+
+        augmented_obs = np.hstack((self.current_obs, predicted_next_obs))
+
+        predicted_action, _ = self.policy.predict(augmented_obs, deterministic=True)
+
+        peek_feature = self._generate_extra_feature(next_obs, predicted_action)
         peek_feature = peek_feature.detach().cpu().numpy()
         if not self.reduce_feature:
             peek_feature = peek_feature[0]
 
-        augmented_obs = np.hstack((self.current_obs, peek_feature))
+        combined_obs = np.hstack((next_obs, peek_feature))
 
-        predicted_action, _ = self.policy.predict(augmented_obs, deterministic=True)
+        self.current_obs = next_obs
 
-        next_peek_feature = self._generate_extra_feature(next_obs, predicted_action)
-        next_peek_feature = next_peek_feature.detach().cpu().numpy()
+        return combined_obs, reward, done, truncated, info
+    
+    # what if, will not provide any value if it perfectly predict the next_obs
+    def step(self, action):
+        next_obs, reward, done, truncated, info = self.original_env.step(action)
+
+        predicted_obs = self._generate_extra_feature(self.current_obs, action)
+        predicted_obs = predicted_obs.detach().cpu().numpy()
         if not self.reduce_feature:
-            next_peek_feature = next_peek_feature[0]
-
-        combined_obs = np.hstack((next_obs, next_peek_feature))
+            predicted_obs = predicted_obs[0]
+        # they are at the same timestep
+        combined_obs = np.hstack((next_obs, predicted_obs))
 
         self.current_obs = next_obs
 
