@@ -13,3 +13,5 @@ src/reaching
 src/models
 events.out.tfevents.*
 
+Metaworld/
+meta/
