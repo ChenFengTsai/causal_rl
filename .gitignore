@@ -7,7 +7,6 @@
 *.npz
 pushing_episodes/
 venv/
-dreamer/
 src/pushing
 src/reaching
 src/models
